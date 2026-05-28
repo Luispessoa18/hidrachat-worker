@@ -203,7 +203,7 @@ python worker.py
 - **HC (HidraCoins)** — tokens ganhos por processar jobs na rede
 - Workers mais rápidos (TK/s maior) ganham mais HC por job
 - O HC acumulado define seu **tier** de acesso ao chat
-- Não há limite de ganhos — quanto mais você rodar, mais você ganha
+- Quanto mais você contribui, mais HC você acumula e maior o seu acesso na rede
 
 ---
 
