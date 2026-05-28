@@ -282,12 +282,61 @@ def run_cli_mode(cfg: Config, prompt: str, max_tokens: int) -> tuple[str, int, i
     return output, int(elapsed * 1000), out_toks, out_toks / elapsed if elapsed > 0 else 0
 
 
+def detect_ram_gb() -> float:
+    try:
+        with open("/proc/meminfo") as f:
+            for line in f:
+                if line.startswith("MemTotal:"):
+                    return round(int(line.split()[1]) / (1024 ** 2), 1)
+    except Exception:
+        pass
+    try:
+        r = subprocess.run(["sysctl", "-n", "hw.memsize"], capture_output=True, text=True, timeout=3)
+        if r.returncode == 0:
+            return round(int(r.stdout.strip()) / (1024 ** 3), 1)
+    except Exception:
+        pass
+    try:
+        r = subprocess.run(["wmic", "computersystem", "get", "TotalPhysicalMemory"],
+                           capture_output=True, text=True, timeout=3)
+        for line in r.stdout.splitlines():
+            if line.strip().isdigit():
+                return round(int(line.strip()) / (1024 ** 3), 1)
+    except Exception:
+        pass
+    return float(os.getenv("HIDRACHAT_RAM_GB", "4"))
+
+
+def detect_gpu(n_gpu_layers: int) -> str:
+    if n_gpu_layers <= 0:
+        return "CPU"
+    try:
+        r = subprocess.run(["nvidia-smi", "--query-gpu=name", "--format=csv,noheader"],
+                           capture_output=True, text=True, timeout=5)
+        if r.returncode == 0 and r.stdout.strip():
+            return r.stdout.strip().splitlines()[0].strip()
+    except Exception:
+        pass
+    try:
+        r = subprocess.run(["rocm-smi", "--showproductname"], capture_output=True, text=True, timeout=5)
+        if r.returncode == 0:
+            return "AMD ROCm"
+    except Exception:
+        pass
+    return "Vulkan/GPU"
+
+
 def register(cfg: Config) -> str:
+    ram = detect_ram_gb()
+    gpu = detect_gpu(cfg.n_gpu_layers)
+    cfg.ram_gb = ram
+    print(f"RAM: {ram} GB  |  Backend: {gpu}")
     res = post_json(f"{cfg.root_url}/worker/register",
                     {"name": cfg.name, "owner_email": cfg.owner_email,
                      "worker_type": "desktop", "region": cfg.region,
                      "model_name": cfg.model_name, "model_size": cfg.model_size,
-                     "ram_gb": cfg.ram_gb, "cpu_threads": cfg.threads, "tokens_per_second": 1})
+                     "ram_gb": ram, "cpu_threads": cfg.threads,
+                     "gpu": gpu, "tokens_per_second": 1})
     return res["worker_id"]
 
 
