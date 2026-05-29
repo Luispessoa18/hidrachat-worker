@@ -444,13 +444,15 @@ def register(cfg: Config) -> str:
     ram = detect_ram_gb()
     gpu = detect_gpu(cfg.n_gpu_layers)
     cfg.ram_gb = ram
-    print(f"RAM: {ram} GB  |  Backend: {gpu}")
+    has_web = bool(cfg.searxng_url)
+    print(f"RAM: {ram} GB  |  Backend: {gpu}  |  Busca web: {'sim' if has_web else 'não'}")
     res = post_json(f"{cfg.root_url}/worker/register",
                     {"name": cfg.name, "owner_email": cfg.owner_email,
                      "worker_type": "desktop", "region": cfg.region,
                      "model_name": cfg.model_name, "model_size": cfg.model_size,
                      "ram_gb": ram, "cpu_threads": cfg.threads,
-                     "gpu": gpu, "tokens_per_second": 1})
+                     "gpu": gpu, "tokens_per_second": 1,
+                     "web_search": has_web})
     return res["worker_id"]
 
 
@@ -476,9 +478,19 @@ def main() -> None:
             if not task.get("job_id"):
                 time.sleep(cfg.poll_seconds)
                 continue
-            print(f"[JOB] {task['job_id']} ({task.get('type','gen')}, {task.get('complexity','?')})")
+            print(f"[JOB] {task['job_id']} ({task.get('type','gen')}, {task.get('complexity','?')}){' [WEB]' if task.get('web_search') else ''}")
             try:
-                prompt = enrich_prompt(cfg, task["prompt"])
+                if task.get("web_search"):
+                    ctx = get_web_context(cfg, task["prompt"])
+                    if ctx:
+                        prompt = (
+                            f"[Contexto obtido da web]\n{ctx}\n\n"
+                            f"Com base no contexto acima, responda: {task['prompt'].strip()}"
+                        )
+                    else:
+                        prompt = task["prompt"]
+                else:
+                    prompt = enrich_prompt(cfg, task["prompt"])
                 if server_mode:
                     out, ms, toks, last_tps = run_server_mode(cfg, prompt, int(task.get("max_tokens") or 256))
                 else:
