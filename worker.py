@@ -6,9 +6,12 @@ import time
 import atexit
 from dataclasses import dataclass
 
+import re
 import urllib.error
+import urllib.parse
 import urllib.request
 import json
+from html.parser import HTMLParser
 from pathlib import Path
 
 
@@ -34,6 +37,7 @@ class Config:
     llama_port:  int   = int(os.getenv("HIDRACHAT_LLAMA_PORT",    "8091"))
     n_gpu_layers: int  = int(os.getenv("HIDRACHAT_N_GPU_LAYERS",  "0"))
     ctx_size:    int   = int(os.getenv("HIDRACHAT_CTX_SIZE",      "4096"))
+    searxng_url: str   = os.getenv("HIDRACHAT_SEARXNG_URL",       "")
     system_prompt: str = os.getenv(
         "HIDRACHAT_SYSTEM_PROMPT",
         "Voce e um assistente direto e util. Responda em portugues do Brasil. "
@@ -149,13 +153,123 @@ def count_tokens_rough(text: str) -> int:
     return max(1, int(len(text.split()) * 1.3))
 
 
+# ── Web search via SearXNG ────────────────────────────────────────────────────
+
+_URL_RE = re.compile(r'https?://[^\s]+')
+
+_WEB_TRIGGERS = [
+    "pesquise sobre", "pesquise", "pesquisar", "pesquisa sobre",
+    "busque sobre", "busque", "buscar", "busca sobre",
+    "procure sobre", "procure", "procurar", "procura sobre",
+    "veja na internet", "veja na web", "veja online",
+    "busca na web", "pesquisa na web", "busca na internet",
+    "acesse", "consulte", "search for", "look up",
+]
+
+
+class _HTMLStripper(HTMLParser):
+    def __init__(self):
+        super().__init__()
+        self._buf: list[str] = []
+        self._skip = False
+
+    def handle_starttag(self, tag, attrs):
+        if tag in ("script", "style", "nav", "footer", "header", "aside"):
+            self._skip = True
+
+    def handle_endtag(self, tag):
+        if tag in ("script", "style", "nav", "footer", "header", "aside"):
+            self._skip = False
+
+    def handle_data(self, data):
+        if not self._skip and data.strip():
+            self._buf.append(data.strip())
+
+    def get_text(self) -> str:
+        return re.sub(r'\s+', ' ', " ".join(self._buf)).strip()
+
+
+def _fetch_url_text(url: str, max_chars: int = 3000) -> str:
+    try:
+        req = urllib.request.Request(url, headers={"User-Agent": "Mozilla/5.0 HidraChat/1.0"})
+        with urllib.request.urlopen(req, timeout=12) as resp:
+            raw = resp.read(131072).decode("utf-8", errors="ignore")
+        p = _HTMLStripper()
+        p.feed(raw)
+        return p.get_text()[:max_chars]
+    except Exception as exc:
+        return f"[erro ao acessar URL: {exc}]"
+
+
+def _searxng_search(base_url: str, query: str, max_results: int = 5, max_chars: int = 3000) -> str:
+    url = f"{base_url.rstrip('/')}/search?q={urllib.parse.quote_plus(query)}&format=json&language=pt"
+    req = urllib.request.Request(url, headers={"User-Agent": "Mozilla/5.0 HidraChat/1.0"})
+    with urllib.request.urlopen(req, timeout=12) as resp:
+        data = json.loads(resp.read().decode("utf-8"))
+    results = data.get("results", [])[:max_results]
+    if not results:
+        return "Nenhum resultado encontrado."
+    parts = []
+    for r in results:
+        title   = r.get("title", "").strip()
+        content = r.get("content", "").strip()
+        source  = r.get("url", "")
+        if content:
+            parts.append(f"{title}\n{content}\nFonte: {source}")
+    return "\n\n".join(parts)[:max_chars]
+
+
+def _extract_query(prompt: str) -> str:
+    lower = prompt.lower()
+    for trigger in _WEB_TRIGGERS:
+        if trigger in lower:
+            idx = lower.find(trigger) + len(trigger)
+            candidate = prompt[idx:].strip().lstrip(":").strip()
+            if candidate:
+                return candidate
+    return prompt.strip()
+
+
+def needs_web(prompt: str) -> bool:
+    if _URL_RE.search(prompt):
+        return True
+    lower = prompt.lower()
+    return any(t in lower for t in _WEB_TRIGGERS)
+
+
+def get_web_context(cfg: "Config", prompt: str) -> str:
+    urls = _URL_RE.findall(prompt)
+    if urls:
+        print(f"[WEB] Acessando URL: {urls[0]}")
+        return _fetch_url_text(urls[0])
+    if not cfg.searxng_url:
+        return ""
+    query = _extract_query(prompt)
+    print(f"[WEB] Buscando no SearXNG: {query!r}")
+    try:
+        return _searxng_search(cfg.searxng_url, query)
+    except Exception as exc:
+        print(f"[WEB] Falha na busca: {exc}")
+        return ""
+
+
+def enrich_prompt(cfg: "Config", prompt: str) -> str:
+    if not needs_web(prompt):
+        return prompt
+    ctx = get_web_context(cfg, prompt)
+    if not ctx:
+        return prompt
+    return (
+        f"[Contexto obtido da web]\n{ctx}\n\n"
+        f"Com base no contexto acima, responda: {prompt.strip()}"
+    )
+
+
 def effective_max_tokens(prompt: str, requested: int) -> int:
     normalized = prompt.strip().lower().replace("!", "").replace(".", "")
     greetings  = {"oi", "ola", "olá", "bom dia", "boa tarde", "boa noite", "hi", "hello"}
     if normalized in greetings:
         return min(requested, 32)
-    if len(prompt.split()) <= 5:
-        return min(requested, 96)
     return requested
 
 
@@ -364,10 +478,11 @@ def main() -> None:
                 continue
             print(f"[JOB] {task['job_id']} ({task.get('type','gen')}, {task.get('complexity','?')})")
             try:
+                prompt = enrich_prompt(cfg, task["prompt"])
                 if server_mode:
-                    out, ms, toks, last_tps = run_server_mode(cfg, task["prompt"], int(task.get("max_tokens") or 256))
+                    out, ms, toks, last_tps = run_server_mode(cfg, prompt, int(task.get("max_tokens") or 256))
                 else:
-                    out, ms, toks, last_tps = run_cli_mode(cfg, task["prompt"], int(task.get("max_tokens") or 256))
+                    out, ms, toks, last_tps = run_cli_mode(cfg, prompt, int(task.get("max_tokens") or 256))
                 print(f"[DONE] {toks} tokens, {last_tps:.1f} tok/s")
                 post_json(f"{cfg.root_url}/job/submit",
                           {"job_id": task["job_id"], "worker_id": worker_id, "output": out,
