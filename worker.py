@@ -379,12 +379,13 @@ def _warmup(cfg: Config) -> None:
         print(f"Warmup failed (continuing anyway): {e}")
 
 
-def run_server_mode(cfg: Config, prompt: str, max_tokens: int) -> tuple[str, int, int, float]:
+def run_server_mode(cfg: Config, prompt: str, max_tokens: int, sys_prompt: str | None = None) -> tuple[str, int, int, float]:
     max_tokens = effective_max_tokens(prompt, max_tokens)
     started    = time.perf_counter()
+    active_sys = sys_prompt if sys_prompt else cfg.system_prompt
     try:
         resp = post_json(llama_server_url(cfg, "/v1/chat/completions"),
-                         {"messages": [{"role": "system", "content": cfg.system_prompt},
+                         {"messages": [{"role": "system", "content": active_sys},
                                        {"role": "user",   "content": prompt.strip()}],
                           "max_tokens": max_tokens, "temperature": 0.35, "top_p": 0.9,
                           "stop": ["\nUsuario:", "\nUsuário:", "\nSistema:"]},
@@ -521,9 +522,14 @@ def main() -> None:
                 continue
             print(f"[JOB] {task['job_id']} ({task.get('type','gen')}, {task.get('complexity','?')}){' [WEB]' if task.get('web_search') else ''}")
             try:
-                # busca web usa a pergunta atual crua (sem historico/memoria)
+                job_type   = task.get("type") or "generation"
+                sys_prompt = task.get("job_system_prompt") or cfg.system_prompt
                 search_src = task.get("raw_prompt") or task["prompt"]
-                if task.get("web_search"):
+
+                if job_type == "web_generation":
+                    # pipeline de sites: prompt já vem formatado, só gerar JSON
+                    prompt = task["prompt"]
+                elif task.get("web_search"):
                     ctx = get_web_context(cfg, search_src)
                     if ctx:
                         prompt = (
@@ -534,8 +540,9 @@ def main() -> None:
                         prompt = task["prompt"]
                 else:
                     prompt = enrich_prompt(cfg, task["prompt"], search_src)
+
                 if server_mode:
-                    out, ms, toks, last_tps = run_server_mode(cfg, prompt, int(task.get("max_tokens") or 256))
+                    out, ms, toks, last_tps = run_server_mode(cfg, prompt, int(task.get("max_tokens") or 256), sys_prompt)
                 else:
                     out, ms, toks, last_tps = run_cli_mode(cfg, prompt, int(task.get("max_tokens") or 256))
                 print(f"[DONE] {toks} tokens, {last_tps:.1f} tok/s")
