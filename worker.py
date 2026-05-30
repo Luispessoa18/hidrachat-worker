@@ -237,20 +237,60 @@ def needs_web(prompt: str) -> bool:
     return any(t in lower for t in _WEB_TRIGGERS)
 
 
+def _server_web_search(root_url: str, query: str, max_results: int = 5, max_chars: int = 3000) -> str:
+    url = f"{root_url.rstrip('/')}/web-search?q={urllib.parse.quote_plus(query)}&max_results={max_results}"
+    req = urllib.request.Request(url, headers={"User-Agent": "HidraWorker/1.0"})
+    with urllib.request.urlopen(req, timeout=12) as resp:
+        data = json.loads(resp.read().decode("utf-8"))
+    results = data.get("results", [])
+    if not results:
+        return "Nenhum resultado encontrado."
+    parts = []
+    for r in results:
+        title   = r.get("title", "").strip()
+        content = r.get("content", "").strip()
+        source  = r.get("url", "")
+        if content:
+            parts.append(f"{title}\n{content}\nFonte: {source}")
+    return "\n\n".join(parts)[:max_chars]
+
+
+def _web_search(cfg: "Config", query: str) -> str:
+    """Busca no SearXNG (local se configurado, senao via proxy do servidor)."""
+    if cfg.searxng_url:
+        print(f"[WEB] Buscando no SearXNG local: {query!r}")
+        try:
+            return _searxng_search(cfg.searxng_url, query)
+        except Exception as exc:
+            print(f"[WEB] Falha no SearXNG local: {exc}")
+    print(f"[WEB] Buscando via servidor: {query!r}")
+    try:
+        return _server_web_search(cfg.root_url, query)
+    except Exception as exc:
+        print(f"[WEB] Falha na busca via servidor: {exc}")
+        return ""
+
+
 def get_web_context(cfg: "Config", prompt: str) -> str:
+    parts: list[str] = []
     urls = _URL_RE.findall(prompt)
+
+    # 1. Sempre fazer a busca (SearXNG) — traz snippets limpos com dados atuais
+    #    (preco, cotacao, clima). A query exclui a URL crua.
+    query = _extract_query(_URL_RE.sub("", prompt).strip()) or prompt.strip()
+    search_text = _web_search(cfg, query)
+    if search_text and search_text != "Nenhum resultado encontrado.":
+        parts.append(search_text)
+
+    # 2. Se o usuario passou uma URL especifica, tentar o conteudo dela tambem.
+    #    (sites com JS pesado retornam pouco, por isso e complemento, nao a base)
     if urls:
         print(f"[WEB] Acessando URL: {urls[0]}")
-        return _fetch_url_text(urls[0])
-    if not cfg.searxng_url:
-        return ""
-    query = _extract_query(prompt)
-    print(f"[WEB] Buscando no SearXNG: {query!r}")
-    try:
-        return _searxng_search(cfg.searxng_url, query)
-    except Exception as exc:
-        print(f"[WEB] Falha na busca: {exc}")
-        return ""
+        page = _fetch_url_text(urls[0])
+        if page and not page.startswith("[erro"):
+            parts.append(f"Conteudo da pagina {urls[0]}:\n{page}")
+
+    return "\n\n".join(parts)
 
 
 def enrich_prompt(cfg: "Config", prompt: str) -> str:
@@ -444,15 +484,14 @@ def register(cfg: Config) -> str:
     ram = detect_ram_gb()
     gpu = detect_gpu(cfg.n_gpu_layers)
     cfg.ram_gb = ram
-    has_web = bool(cfg.searxng_url)
-    print(f"RAM: {ram} GB  |  Backend: {gpu}  |  Busca web: {'sim' if has_web else 'não'}")
+    print(f"RAM: {ram} GB  |  Backend: {gpu}  |  Busca web: sim (via servidor)")
     res = post_json(f"{cfg.root_url}/worker/register",
                     {"name": cfg.name, "owner_email": cfg.owner_email,
                      "worker_type": "desktop", "region": cfg.region,
                      "model_name": cfg.model_name, "model_size": cfg.model_size,
                      "ram_gb": ram, "cpu_threads": cfg.threads,
                      "gpu": gpu, "tokens_per_second": 1,
-                     "web_search": has_web})
+                     "web_search": True})
     return res["worker_id"]
 
 
