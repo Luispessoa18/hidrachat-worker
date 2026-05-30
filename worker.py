@@ -293,10 +293,12 @@ def get_web_context(cfg: "Config", prompt: str) -> str:
     return "\n\n".join(parts)
 
 
-def enrich_prompt(cfg: "Config", prompt: str) -> str:
-    if not needs_web(prompt):
+def enrich_prompt(cfg: "Config", prompt: str, search_src: str | None = None) -> str:
+    # search_src = pergunta atual crua (sem historico); cai pra prompt se ausente
+    src = search_src or prompt
+    if not needs_web(src):
         return prompt
-    ctx = get_web_context(cfg, prompt)
+    ctx = get_web_context(cfg, src)
     if not ctx:
         return prompt
     return (
@@ -519,8 +521,10 @@ def main() -> None:
                 continue
             print(f"[JOB] {task['job_id']} ({task.get('type','gen')}, {task.get('complexity','?')}){' [WEB]' if task.get('web_search') else ''}")
             try:
+                # busca web usa a pergunta atual crua (sem historico/memoria)
+                search_src = task.get("raw_prompt") or task["prompt"]
                 if task.get("web_search"):
-                    ctx = get_web_context(cfg, task["prompt"])
+                    ctx = get_web_context(cfg, search_src)
                     if ctx:
                         prompt = (
                             f"[Contexto obtido da web]\n{ctx}\n\n"
@@ -529,7 +533,7 @@ def main() -> None:
                     else:
                         prompt = task["prompt"]
                 else:
-                    prompt = enrich_prompt(cfg, task["prompt"])
+                    prompt = enrich_prompt(cfg, task["prompt"], search_src)
                 if server_mode:
                     out, ms, toks, last_tps = run_server_mode(cfg, prompt, int(task.get("max_tokens") or 256))
                 else:
